@@ -7,8 +7,11 @@ from datetime import datetime, timezone
 
 # --- CONFIG ---
 import os
-from dotenv import load_dotenv
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 TOKEN = os.environ.get("TOKEN")
 STATUS_CHANNEL_ID = int(os.environ.get("STATUS_CHANNEL_ID"))
 
