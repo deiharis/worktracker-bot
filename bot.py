@@ -35,14 +35,13 @@ def save_data(data):
 
 @tree.command(name="clockin", description="Clock in to start your work session")
 async def clockin(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
     data = load_data()
     user_id = str(interaction.user.id)
     username = interaction.user.display_name
 
     if user_id in data["active_sessions"]:
-        await interaction.followup.send(
-            "⚠️ You are already clocked in! Use `/clockout` to end your session first.",
+        await interaction.response.send_message(
+            "⚠️ You're already clocked in! Use `/clockout` to end your session first.",
             ephemeral=True
         )
         return
@@ -54,6 +53,7 @@ async def clockin(interaction: discord.Interaction):
     }
     save_data(data)
 
+    # Post to status channel
     channel = bot.get_channel(STATUS_CHANNEL_ID)
     embed = discord.Embed(
         title="🟢 Clocked In",
@@ -64,10 +64,11 @@ async def clockin(interaction: discord.Interaction):
     embed.set_footer(text=f"User ID: {user_id}")
     await channel.send(embed=embed)
 
-    await interaction.followup.send(
-        f"✅ You have been clocked in at `{now.strftime('%Y-%m-%d %H:%M:%S')} UTC`. Good luck!",
+    await interaction.response.send_message(
+        f"✅ You've been clocked in at `{now.strftime('%Y-%m-%d %H:%M:%S')} UTC`. Good luck!",
         ephemeral=True
     )
+
 
 class WorkDescriptionModal(discord.ui.Modal, title="Work Session Summary"):
     description = discord.ui.TextInput(
@@ -131,12 +132,14 @@ async def clockout(interaction: discord.Interaction):
 
     if user_id not in data["active_sessions"]:
         await interaction.response.send_message(
-            "⚠️ You are not clocked in! Use `/clockin` to start a session.",
+            "⚠️ You're not clocked in! Use `/clockin` to start a session.",
             ephemeral=True
         )
         return
 
+    # This opens the modal (popup form) asking for a work description
     await interaction.response.send_modal(WorkDescriptionModal())
+
 
 @tree.command(name="mystats", description="See your work history and total hours")
 async def mystats(interaction: discord.Interaction):
