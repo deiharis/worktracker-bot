@@ -7,9 +7,10 @@ from datetime import datetime, timezone
 
 # --- CONFIG ---
 import os
+from dotenv import load_dotenv
+load_dotenv()
 TOKEN = os.environ.get("TOKEN")
 STATUS_CHANNEL_ID = int(os.environ.get("STATUS_CHANNEL_ID"))
-LOG_FILE = "work_log.json"
 
 intents = discord.Intents.default()
 intents.message_content = True
