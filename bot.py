@@ -1,13 +1,13 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-import json
 import os
 import io
 from datetime import datetime, timezone
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from supabase import create_client, Client
 
 try:
     from dotenv import load_dotenv
@@ -17,7 +17,10 @@ except ImportError:
 
 TOKEN = os.environ.get("TOKEN")
 STATUS_CHANNEL_ID = int(os.environ.get("STATUS_CHANNEL_ID"))
-LOG_FILE = "work_log.json"
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -34,38 +37,20 @@ def format_duration(total_seconds):
     return f"{hours}h {minutes}m {seconds}s"
 
 
-def get_session_seconds(s):
-    if "duration_seconds" in s:
-        return s["duration_seconds"]
-    elif "duration_minutes" in s:
-        return s["duration_minutes"] * 60
-    return 0
-
-
-def get_user_total_seconds(sessions, user_id):
-    return sum(get_session_seconds(s) for s in sessions if s["user_id"] == user_id)
-
-
-def load_data():
-    if os.path.exists(LOG_FILE):
-        with open(LOG_FILE, "r") as f:
-            return json.load(f)
-    return {"active_sessions": {}, "completed_sessions": []}
-
-
-def save_data(data):
-    with open(LOG_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+def get_month_key(dt=None):
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+    return dt.strftime("%Y-%m")
 
 
 @tree.command(name="clockin", description="Clock in to start your work session")
 async def clockin(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    data = load_data()
     user_id = str(interaction.user.id)
     username = interaction.user.display_name
 
-    if user_id in data["active_sessions"]:
+    existing = supabase.table("active_sessions").select("user_id").eq("user_id", user_id).execute()
+    if existing.data:
         await interaction.followup.send(
             "⚠️ You are already clocked in! Use `/clockout` to end your session first.",
             ephemeral=True
@@ -73,11 +58,11 @@ async def clockin(interaction: discord.Interaction):
         return
 
     now = datetime.now(timezone.utc)
-    data["active_sessions"][user_id] = {
+    supabase.table("active_sessions").insert({
+        "user_id": user_id,
         "username": username,
         "clock_in": now.isoformat()
-    }
-    save_data(data)
+    }).execute()
 
     channel = bot.get_channel(STATUS_CHANNEL_ID)
     embed = discord.Embed(
@@ -105,26 +90,35 @@ class WorkDescriptionModal(discord.ui.Modal, title="Work Session Summary"):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        data = load_data()
         user_id = str(interaction.user.id)
         username = interaction.user.display_name
 
-        session = data["active_sessions"].pop(user_id)
+        active = supabase.table("active_sessions").select("*").eq("user_id", user_id).execute()
+        if not active.data:
+            await interaction.response.send_message(
+                "⚠️ Could not find your active session. Please try again.",
+                ephemeral=True
+            )
+            return
+
+        session = active.data[0]
         clock_in = datetime.fromisoformat(session["clock_in"])
         clock_out = datetime.now(timezone.utc)
         total_seconds = int((clock_out - clock_in).total_seconds())
         readable = format_duration(total_seconds)
+        month_key = get_month_key(clock_in)
 
-        entry = {
+        supabase.table("completed_sessions").insert({
             "user_id": user_id,
             "username": username,
-            "clock_in": session["clock_in"],
+            "clock_in": clock_in.isoformat(),
             "clock_out": clock_out.isoformat(),
             "duration_seconds": total_seconds,
-            "description": str(self.description)
-        }
-        data["completed_sessions"].append(entry)
-        save_data(data)
+            "description": str(self.description),
+            "month_key": month_key
+        }).execute()
+
+        supabase.table("active_sessions").delete().eq("user_id", user_id).execute()
 
         channel = bot.get_channel(STATUS_CHANNEL_ID)
         embed = discord.Embed(
@@ -150,31 +144,30 @@ class WorkDescriptionModal(discord.ui.Modal, title="Work Session Summary"):
 
 @tree.command(name="clockout", description="Clock out and submit your work summary")
 async def clockout(interaction: discord.Interaction):
-    data = load_data()
     user_id = str(interaction.user.id)
-
-    if user_id not in data["active_sessions"]:
+    existing = supabase.table("active_sessions").select("user_id").eq("user_id", user_id).execute()
+    if not existing.data:
         await interaction.response.send_message(
             "⚠️ You are not clocked in! Use `/clockin` to start a session.",
             ephemeral=True
         )
         return
-
     await interaction.response.send_modal(WorkDescriptionModal())
 
 
 @tree.command(name="mystats", description="See a quick summary of your work history")
 async def mystats(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    data = load_data()
     user_id = str(interaction.user.id)
-    sessions = [s for s in data["completed_sessions"] if s["user_id"] == user_id]
+
+    result = supabase.table("completed_sessions").select("*").eq("user_id", user_id).order("clock_in", desc=False).execute()
+    sessions = result.data
 
     if not sessions:
         await interaction.followup.send("No completed sessions found.", ephemeral=True)
         return
 
-    total_seconds = get_user_total_seconds(data["completed_sessions"], user_id)
+    total_seconds = sum(s["duration_seconds"] for s in sessions)
     recent = sessions[-5:]
 
     embed = discord.Embed(
@@ -188,7 +181,7 @@ async def mystats(interaction: discord.Interaction):
     )
     for s in reversed(recent):
         ci = datetime.fromisoformat(s["clock_in"]).strftime("%b %d, %H:%M")
-        dur = format_duration(get_session_seconds(s))
+        dur = format_duration(s["duration_seconds"])
         embed.add_field(
             name=f"{ci} UTC — {dur}",
             value=s["description"][:100] + ("..." if len(s["description"]) > 100 else ""),
@@ -200,15 +193,16 @@ async def mystats(interaction: discord.Interaction):
 @tree.command(name="teamstatus", description="See who is currently clocked in")
 async def teamstatus(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    data = load_data()
+    result = supabase.table("active_sessions").select("*").execute()
+    sessions = result.data
 
-    if not data["active_sessions"]:
+    if not sessions:
         await interaction.followup.send("Nobody is currently clocked in.", ephemeral=True)
         return
 
     embed = discord.Embed(title="👥 Currently Working", color=0x00BFA5)
     now = datetime.now(timezone.utc)
-    for uid, session in data["active_sessions"].items():
+    for session in sessions:
         ci = datetime.fromisoformat(session["clock_in"])
         elapsed = format_duration(int((now - ci).total_seconds()))
         embed.add_field(
@@ -222,23 +216,21 @@ async def teamstatus(interaction: discord.Interaction):
 @tree.command(name="myreport", description="See your full personal time report with monthly breakdown")
 async def myreport(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    data = load_data()
     user_id = str(interaction.user.id)
-    sessions = [s for s in data["completed_sessions"] if s["user_id"] == user_id]
+
+    result = supabase.table("completed_sessions").select("*").eq("user_id", user_id).order("clock_in", desc=False).execute()
+    sessions = result.data
 
     if not sessions:
-        await interaction.followup.send(
-            "You have no completed sessions yet.", ephemeral=True
-        )
+        await interaction.followup.send("You have no completed sessions yet.", ephemeral=True)
         return
 
-    total_seconds = get_user_total_seconds(data["completed_sessions"], user_id)
+    total_seconds = sum(s["duration_seconds"] for s in sessions)
 
     monthly = {}
     for s in sessions:
-        ci = datetime.fromisoformat(s["clock_in"])
-        month_key = ci.strftime("%B %Y")
-        monthly[month_key] = monthly.get(month_key, 0) + get_session_seconds(s)
+        mk = s["month_key"]
+        monthly[mk] = monthly.get(mk, 0) + s["duration_seconds"]
 
     embed = discord.Embed(
         title=f"📋 Personal Report — {interaction.user.display_name}",
@@ -250,8 +242,15 @@ async def myreport(interaction: discord.Interaction):
         inline=False
     )
 
-    sorted_months = sorted(monthly.items(), key=lambda x: datetime.strptime(x[0], "%B %Y"))
-    monthly_lines = [f"**{month}:** {format_duration(secs)}" for month, secs in sorted_months]
+    sorted_months = sorted(monthly.items())
+    monthly_lines = []
+    for mk, secs in sorted_months:
+        try:
+            label = datetime.strptime(mk, "%Y-%m").strftime("%B %Y")
+        except ValueError:
+            label = mk
+        monthly_lines.append(f"**{label}:** {format_duration(secs)}")
+
     embed.add_field(
         name="📅 Monthly Breakdown",
         value="\n".join(monthly_lines) if monthly_lines else "No data",
@@ -262,7 +261,7 @@ async def myreport(interaction: discord.Interaction):
     session_lines = []
     for s in reversed(recent):
         ci = datetime.fromisoformat(s["clock_in"])
-        dur = format_duration(get_session_seconds(s))
+        dur = format_duration(s["duration_seconds"])
         date_str = ci.strftime("%b %d, %Y at %H:%M UTC")
         preview = s["description"][:80] + ("..." if len(s["description"]) > 80 else "")
         session_lines.append(f"**{date_str}** — {dur}\n_{preview}_")
@@ -278,8 +277,9 @@ async def myreport(interaction: discord.Interaction):
 @tree.command(name="serverreport", description="See total hours logged by everyone, with a chart")
 async def serverreport(interaction: discord.Interaction):
     await interaction.response.defer()
-    data = load_data()
-    sessions = data["completed_sessions"]
+
+    result = supabase.table("completed_sessions").select("*").execute()
+    sessions = result.data
 
     if not sessions:
         await interaction.followup.send("No sessions have been logged yet.")
@@ -288,10 +288,9 @@ async def serverreport(interaction: discord.Interaction):
     user_totals = {}
     for s in sessions:
         uid = s["user_id"]
-        secs = get_session_seconds(s)
         if uid not in user_totals:
             user_totals[uid] = {"username": s["username"], "seconds": 0}
-        user_totals[uid]["seconds"] += secs
+        user_totals[uid]["seconds"] += s["duration_seconds"]
 
     sorted_users = sorted(user_totals.items(), key=lambda x: x[1]["seconds"], reverse=True)
 
@@ -358,14 +357,13 @@ async def serverreport(interaction: discord.Interaction):
 @tree.command(name="editsessions", description="View your recent sessions so you can find which one to edit")
 async def editsessions(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    data = load_data()
     user_id = str(interaction.user.id)
-    sessions = [s for s in data["completed_sessions"] if s["user_id"] == user_id]
+
+    result = supabase.table("completed_sessions").select("*").eq("user_id", user_id).order("clock_in", desc=False).execute()
+    sessions = result.data
 
     if not sessions:
-        await interaction.followup.send(
-            "You have no completed sessions to edit.", ephemeral=True
-        )
+        await interaction.followup.send("You have no completed sessions to edit.", ephemeral=True)
         return
 
     recent = sessions[-10:]
@@ -375,7 +373,7 @@ async def editsessions(interaction: discord.Interaction):
         real_index = total - i
         ci = datetime.fromisoformat(s["clock_in"]).strftime("%Y-%m-%d %H:%M UTC")
         co = datetime.fromisoformat(s["clock_out"]).strftime("%H:%M UTC")
-        dur = format_duration(get_session_seconds(s))
+        dur = format_duration(s["duration_seconds"])
         lines.append(f"`#{real_index}` — **{ci}** → **{co}** ({dur})")
 
     embed = discord.Embed(
@@ -409,14 +407,13 @@ async def edittime(
     new_time: str
 ):
     await interaction.response.defer(ephemeral=True)
-    data = load_data()
     user_id = str(interaction.user.id)
-    user_sessions = [s for s in data["completed_sessions"] if s["user_id"] == user_id]
+
+    result = supabase.table("completed_sessions").select("*").eq("user_id", user_id).order("clock_in", desc=False).execute()
+    user_sessions = result.data
 
     if not user_sessions:
-        await interaction.followup.send(
-            "You have no completed sessions to edit.", ephemeral=True
-        )
+        await interaction.followup.send("You have no completed sessions to edit.", ephemeral=True)
         return
 
     total = len(user_sessions)
@@ -437,23 +434,9 @@ async def edittime(
         return
 
     target = user_sessions[session_number - 1]
-    global_index = None
-    for i, s in enumerate(data["completed_sessions"]):
-        if (s["user_id"] == user_id
-                and s["clock_in"] == target["clock_in"]
-                and s["clock_out"] == target["clock_out"]):
-            global_index = i
-            break
-
-    if global_index is None:
-        await interaction.followup.send(
-            "❌ Could not locate that session. Please try again.", ephemeral=True
-        )
-        return
-
-    session = data["completed_sessions"][global_index]
-    old_clock_in = datetime.fromisoformat(session["clock_in"])
-    old_clock_out = datetime.fromisoformat(session["clock_out"])
+    record_id = target["id"]
+    old_clock_in = datetime.fromisoformat(target["clock_in"])
+    old_clock_out = datetime.fromisoformat(target["clock_out"])
 
     if field == "clock_in":
         if new_dt >= old_clock_out:
@@ -464,7 +447,6 @@ async def edittime(
             )
             return
         old_value_str = old_clock_in.strftime("%Y-%m-%d %H:%M UTC")
-        session["clock_in"] = new_dt.isoformat()
         new_clock_in, new_clock_out = new_dt, old_clock_out
     else:
         if new_dt <= old_clock_in:
@@ -475,14 +457,16 @@ async def edittime(
             )
             return
         old_value_str = old_clock_out.strftime("%Y-%m-%d %H:%M UTC")
-        session["clock_out"] = new_dt.isoformat()
         new_clock_in, new_clock_out = old_clock_in, new_dt
 
     new_total_seconds = int((new_clock_out - new_clock_in).total_seconds())
-    session["duration_seconds"] = new_total_seconds
-    session.pop("duration_minutes", None)
-    data["completed_sessions"][global_index] = session
-    save_data(data)
+    new_month_key = get_month_key(new_clock_in)
+
+    supabase.table("completed_sessions").update({
+        field: new_dt.isoformat(),
+        "duration_seconds": new_total_seconds,
+        "month_key": new_month_key
+    }).eq("id", record_id).execute()
 
     embed = discord.Embed(title="✏️ Session Updated", color=0x00C853)
     embed.add_field(name="Session", value=f"#{session_number}", inline=True)
@@ -491,6 +475,114 @@ async def edittime(
     embed.add_field(name="New Value", value=f"{new_time} UTC", inline=False)
     embed.add_field(name="Recalculated Duration", value=format_duration(new_total_seconds), inline=False)
     embed.set_footer(text="Your log has been updated.")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="resetmonth", description="Admin only: archive this month's logs and start fresh")
+async def resetmonth(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    admin_ids = os.environ.get("ADMIN_IDS", "")
+    allowed = [uid.strip() for uid in admin_ids.split(",") if uid.strip()]
+
+    if str(interaction.user.id) not in allowed:
+        await interaction.followup.send(
+            "❌ You do not have permission to run this command.",
+            ephemeral=True
+        )
+        return
+
+    result = supabase.table("completed_sessions").select("*").execute()
+    sessions = result.data
+
+    if not sessions:
+        await interaction.followup.send(
+            "There are no completed sessions to archive. The log is already empty.",
+            ephemeral=True
+        )
+        return
+
+    archive_rows = []
+    for s in sessions:
+        archive_rows.append({
+            "user_id": s["user_id"],
+            "username": s["username"],
+            "clock_in": s["clock_in"],
+            "clock_out": s["clock_out"],
+            "duration_seconds": s["duration_seconds"],
+            "description": s["description"],
+            "month_key": s["month_key"]
+        })
+
+    supabase.table("archived_sessions").insert(archive_rows).execute()
+    supabase.table("completed_sessions").delete().neq("id", 0).execute()
+
+    now = datetime.now(timezone.utc)
+    embed = discord.Embed(
+        title="🗂️ Month Reset Complete",
+        color=0x00C853,
+        timestamp=now
+    )
+    embed.add_field(
+        name="Sessions Archived",
+        value=f"`{len(sessions)}` session(s) moved to the archive table in Supabase",
+        inline=False
+    )
+    embed.add_field(
+        name="Active Sessions",
+        value="Anyone currently clocked in has been left untouched.",
+        inline=False
+    )
+    embed.add_field(
+        name="Fresh Start",
+        value="The live log is now empty and ready for the new month.",
+        inline=False
+    )
+    embed.set_footer(text=f"Reset performed by {interaction.user.display_name}")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="viewlog", description="Admin only: display a summary of the current work log")
+async def viewlog(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    admin_ids = os.environ.get("ADMIN_IDS", "")
+    allowed = [uid.strip() for uid in admin_ids.split(",") if uid.strip()]
+
+    if str(interaction.user.id) not in allowed:
+        await interaction.followup.send(
+            "❌ You do not have permission to run this command.",
+            ephemeral=True
+        )
+        return
+
+    active_result = supabase.table("active_sessions").select("*").execute()
+    completed_result = supabase.table("completed_sessions").select("*").execute()
+    active_sessions = active_result.data
+    completed_sessions = completed_result.data
+
+    user_totals = {}
+    for s in completed_sessions:
+        uid = s["user_id"]
+        if uid not in user_totals:
+            user_totals[uid] = {"username": s["username"], "seconds": 0}
+        user_totals[uid]["seconds"] += s["duration_seconds"]
+
+    sorted_users = sorted(user_totals.items(), key=lambda x: x[1]["seconds"], reverse=True)
+    lines = [f"**{info['username']}** — `{format_duration(info['seconds'])}`" for _, info in sorted_users]
+
+    embed = discord.Embed(
+        title="📁 Current Work Log",
+        color=0x7C4DFF,
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(name="Active Sessions", value=str(len(active_sessions)), inline=True)
+    embed.add_field(name="Completed Sessions", value=str(len(completed_sessions)), inline=True)
+    embed.add_field(
+        name="Totals Per User",
+        value="\n".join(lines) if lines else "No data yet.",
+        inline=False
+    )
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
