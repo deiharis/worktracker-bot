@@ -3,6 +3,7 @@ from discord.ext import commands
 from discord import app_commands
 import os
 import io
+import asyncio
 from datetime import datetime, timezone
 import matplotlib
 matplotlib.use('Agg')
@@ -41,6 +42,18 @@ def get_month_key(dt=None):
     if dt is None:
         dt = datetime.now(timezone.utc)
     return dt.strftime("%Y-%m")
+
+
+async def health_server():
+    async def handle(reader, writer):
+        await reader.read(1024)
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+        await writer.drain()
+        writer.close()
+    port = int(os.environ.get("PORT", 8080))
+    server = await asyncio.start_server(handle, "0.0.0.0", port)
+    async with server:
+        await server.serve_forever()
 
 
 @tree.command(name="clockin", description="Clock in to start your work session")
@@ -586,29 +599,25 @@ async def viewlog(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
-    def log_message(self, format, *args):
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CommandInvokeError):
+        if isinstance(error.original, discord.errors.NotFound):
+            return
+    try:
+        await interaction.followup.send(
+            "⚠️ Something went wrong. Please try the command again.",
+            ephemeral=True
+        )
+    except Exception:
         pass
 
-def run_health_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    server.serve_forever()
 
 @bot.event
 async def on_ready():
     await tree.sync()
+    asyncio.create_task(health_server())
     print(f"✅ Bot is online as {bot.user}")
 
-threading.Thread(target=run_health_server, daemon=True).start()
+
 bot.run(TOKEN)
